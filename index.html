@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Object Identifier</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: #0e1014; color: #f2f3f5;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; align-items: center; padding: 20px; gap: 16px;
+  }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0; letter-spacing: .02em; color: #9aa3b2; }
+  .stage {
+    position: relative; width: min(100%, 720px); aspect-ratio: 4 / 3;
+    background: #000; border-radius: 16px; overflow: hidden;
+  }
+  video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  video.mirror { transform: scaleX(-1); }
+  .frame {
+    position: absolute; inset: 0; margin: auto; height: 80%; aspect-ratio: 1;
+    border: 2px dashed rgba(255,255,255,.45); border-radius: 14px; pointer-events: none;
+  }
+  .status {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 24px; background: rgba(0,0,0,.72); font-size: 1rem; line-height: 1.5;
+  }
+  .status[hidden] { display: none; }
+  .panel { width: min(100%, 720px); }
+  .top { font-size: 2rem; font-weight: 700; text-transform: capitalize; min-height: 2.6rem; }
+  .top small { font-size: 1rem; font-weight: 500; color: #6ee7a8; margin-left: 8px; }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: .95rem; color: #c3c9d4; }
+  .row span:first-child { flex: 0 0 45%; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar { flex: 1; height: 8px; background: #232733; border-radius: 4px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: #6ee7a8; transition: width .2s; }
+  .row span:last-child { flex: 0 0 44px; text-align: right; font-variant-numeric: tabular-nums; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  button, select {
+    background: #232733; color: #f2f3f5; border: 1px solid #343a4a; border-radius: 10px;
+    padding: 10px 14px; font-size: .95rem; cursor: pointer; max-width: 100%;
+  }
+  .fps { margin-left: auto; color: #6b7384; font-size: .85rem; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <h1>LIVE OBJECT IDENTIFIER</h1>
+
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <div class="frame"></div>
+    <div class="status" id="status">Loading the vision model…<br>(first run downloads about 90 MB, then it's cached)</div>
+  </div>
+
+  <div class="panel">
+    <div class="top" id="top">—</div>
+    <div id="rows"></div>
+    <div class="controls">
+      <button id="pause">Pause</button>
+      <select id="cams" title="Camera"></select>
+      <span class="fps" id="fps"></span>
+    </div>
+  </div>
+
+<script type="module">
+import { pipeline, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+
+const MODEL = 'Xenova/vit-base-patch16-224'; // ImageNet, 1,000 everyday object classes
+const TOP_K = 3;          // how many guesses to show
+const SMOOTH = 0.6;       // 0 = no smoothing, closer to 1 = steadier but slower to change
+const MIN_CONFIDENCE = 0.25;
+
+const $ = id => document.getElementById(id);
+const video = $('video'), statusEl = $('status'), topEl = $('top'), rowsEl = $('rows');
+const canvas = document.createElement('canvas');
+canvas.width = canvas.height = 224;
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+let classifier, stream, paused = false;
+let scores = new Map(); // label -> smoothed score
+
+function showStatus(html) { statusEl.innerHTML = html; statusEl.hidden = false; }
+
+async function startCamera(deviceId) {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: deviceId ? { deviceId: { exact: deviceId } }
+                    : { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+  });
+  video.srcObject = stream;
+  await video.play();
+  const facing = stream.getVideoTracks()[0].getSettings().facingMode;
+  video.classList.toggle('mirror', facing !== 'environment'); // mirror webcams/selfie cams
+  scores.clear();
+}
+
+async function listCameras() {
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const current = stream.getVideoTracks()[0].getSettings().deviceId;
+  $('cams').innerHTML = '';
+  cams.forEach((c, i) => {
+    const o = new Option(c.label || `Camera ${i + 1}`, c.deviceId);
+    o.selected = c.deviceId === current;
+    $('cams').add(o);
+  });
+  $('cams').hidden = cams.length < 2;
+}
+
+function grabFrame() {
+  // Centre square of the video (the dashed box), scaled to the model's input size.
+  const w = video.videoWidth, h = video.videoHeight;
+  const side = Math.min(w, h) * 0.8;
+  ctx.drawImage(video, (w - side) / 2, (h - side) / 2, side, side, 0, 0, 224, 224);
+  return RawImage.fromCanvas(canvas);
+}
+
+function render() {
+  const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_K);
+  if (!ranked.length) return;
+  const name = l => l.split(',')[0]; // "remote control, remote" -> "remote control"
+  const [best, conf] = ranked[0];
+  topEl.innerHTML = conf >= MIN_CONFIDENCE
+    ? `${name(best)}<small>${Math.round(conf * 100)}%</small>`
+    : `<span style="color:#6b7384">Not sure — hold it closer</span>`;
+  rowsEl.innerHTML = ranked.map(([l, s]) =>
+    `<div class="row"><span>${name(l)}</span><div class="bar"><i style="width:${Math.round(s * 100)}%"></i></div><span>${Math.round(s * 100)}%</span></div>`
+  ).join('');
+}
+
+async function loop() {
+  let last = performance.now();
+  while (true) {
+    if (paused || video.readyState < 2 || !video.videoWidth) {
+      await new Promise(r => setTimeout(r, 100));
+      continue;
+    }
+    try {
+      const results = await classifier(grabFrame(), { top_k: 5 });
+      // Exponential smoothing so the label doesn't flicker frame to frame.
+      for (const [l, s] of scores) scores.set(l, s * SMOOTH);
+      for (const { label, score } of results)
+        scores.set(label, (scores.get(label) || 0) + score * (1 - SMOOTH));
+      for (const [l, s] of scores) if (s < 0.005) scores.delete(l);
+      render();
+    } catch (e) { console.error(e); }
+    const now = performance.now();
+    $('fps').textContent = `${(1000 / (now - last)).toFixed(1)} fps`;
+    last = now;
+    await new Promise(r => requestAnimationFrame(r));
+  }
+}
+
+$('pause').onclick = () => {
+  paused = !paused;
+  $('pause').textContent = paused ? 'Resume' : 'Pause';
+  paused ? video.pause() : video.play();
+};
+$('cams').onchange = e => startCamera(e.target.value).catch(console.error);
+
+(async () => {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia)
+      throw new Error('This browser blocks the camera here. Open the file in Chrome or Edge on a computer with a webcam.');
+    const [c] = await Promise.all([
+      pipeline('image-classification', MODEL, {
+        progress_callback: p => {
+          if (p.status === 'progress' && p.file?.endsWith('.onnx'))
+            showStatus(`Downloading the vision model… ${Math.round(p.progress)}%`);
+        },
+      }),
+      startCamera(),
+    ]);
+    classifier = c;
+    await listCameras();
+    statusEl.hidden = true;
+    loop();
+  } catch (e) {
+    console.error(e);
+    const msg = e.name === 'NotAllowedError' ? 'Camera permission was denied. Allow it in the address bar and reload.'
+              : e.name === 'NotFoundError' ? 'No camera found. Plug in a webcam and reload.'
+              : e.message;
+    showStatus(`Couldn't start.<br>${msg}`);
+  }
+})();
+</script>
+</body>
+</html>
